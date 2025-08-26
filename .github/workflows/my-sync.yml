@@ -1,0 +1,616 @@
+name: 同步Fork与上游仓库
+
+on:
+  schedule:
+    - cron: "0 2 * * 2"   # 每周二凌晨2点执行（避开周末高峰）
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: '强制同步（忽略删除保护）'
+        required: false
+        default: 'false'
+        type: boolean
+      delete_files_threshold:
+        description: '删除文件数量阈值 (%)'
+        required: false
+        default: '40'
+      readme_diff_threshold:
+        description: 'README.md 差异比例阈值 (%)'
+        required: false
+        default: '50'
+      critical_files_threshold:
+        description: '关键构建文件删除数量阈值'
+        required: false
+        default: '5'
+      total_change_threshold:
+        description: '总变化率阈值 (%)'
+        required: false
+        default: '60'
+      code_lines_threshold:
+        description: '代码总变化行数阈值'
+        required: false
+        default: '2000'
+      total_weight:
+        description: '常规模式-总变化权重 (%)'
+        required: false
+        default: '70'
+      net_weight:
+        description: '常规模式-净变化权重 (%)'
+        required: false
+        default: '30'
+      overlap_threshold_high:
+        description: '重构模式触发阈值 (%)'
+        required: false
+        default: '80'
+      overlap_threshold_mid:
+        description: '大规模更新触发阈值 (%)'
+        required: false
+        default: '60'
+
+env:
+  DELETE_FILES_THRESHOLD: ${{ github.event.inputs.delete_files_threshold || '40' }}
+  README_DIFF_THRESHOLD: ${{ github.event.inputs.readme_diff_threshold || '50' }}
+  CRITICAL_FILES_THRESHOLD: ${{ github.event.inputs.critical_files_threshold || '5' }}
+  TOTAL_CHANGE_THRESHOLD: ${{ github.event.inputs.total_change_threshold || '60' }}
+  CODE_LINES_THRESHOLD: ${{ github.event.inputs.code_lines_threshold || '2000' }}
+  TOTAL_WEIGHT: ${{ github.event.inputs.total_weight || '70' }}
+  NET_WEIGHT: ${{ github.event.inputs.net_weight || '30' }}
+  OVERLAP_THRESHOLD_HIGH: ${{ github.event.inputs.overlap_threshold_high || '80' }}
+  OVERLAP_THRESHOLD_MID: ${{ github.event.inputs.overlap_threshold_mid || '60' }}
+  UPSTREAM_REPO: "AyuGram/AyuGramDesktop"  # 修改为你的上游仓库
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出Fork仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置Git用户信息
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: 验证上游仓库配置
+        id: validate_repos
+        run: |
+          echo "===== 🔍 验证仓库关系 ====="
+          
+          UPSTREAM_REPO="${{ env.UPSTREAM_REPO }}"
+          
+          # 检查上游仓库是否配置
+          if [[ -z "$UPSTREAM_REPO" ]]; then
+            echo "::error::❌ 未配置上游仓库！"
+            echo "请在 workflow 文件的 env 部分设置："
+            echo '  UPSTREAM_REPO: "owner/repo"'
+            exit 1
+          fi
+          
+          echo "📌 当前仓库: ${{ github.repository }}"
+          echo "📝 配置的上游: $UPSTREAM_REPO"
+          echo ""
+          
+          # 验证上游仓库是否存在且可访问
+          echo "🌐 验证上游仓库可访问性..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                        "https://api.github.com/repos/$UPSTREAM_REPO")
+          
+          if [[ "$HTTP_STATUS" == "200" ]]; then
+            echo "✅ 上游仓库存在且可访问"
+          elif [[ "$HTTP_STATUS" == "404" ]]; then
+            echo "::error::❌ 上游仓库不存在: $UPSTREAM_REPO"
+            echo "请检查仓库名称是否正确"
+            exit 1
+          elif [[ "$HTTP_STATUS" == "403" ]]; then
+            # API限制时尝试直接git访问
+            echo "⚠️ API访问受限，尝试直接Git访问..."
+            if git ls-remote "https://github.com/${UPSTREAM_REPO}.git" HEAD &>/dev/null; then
+              echo "✅ 上游仓库可通过Git访问"
+            else
+              echo "::error::❌ 无法访问上游仓库（可能是私有仓库）"
+              exit 1
+            fi
+          else
+            echo "::error::❌ 无法访问上游仓库 (HTTP $HTTP_STATUS)"
+            exit 1
+          fi
+          
+          echo "validation_passed=true" >> $GITHUB_OUTPUT
+
+      - name: 添加上游仓库
+        if: steps.validate_repos.outputs.validation_passed == 'true'
+        run: |
+          # 添加或更新上游仓库
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          else
+            git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          fi
+          
+          # 获取所有更新
+          echo "📥 获取上游和origin的最新代码..."
+          git fetch upstream
+          git fetch origin
+
+      - name: 检测分支信息
+        id: detect_branches
+        if: steps.validate_repos.outputs.validation_passed == 'true'
+        run: |
+          # 自动检测上游的默认分支
+          UPSTREAM_BRANCH=$(git remote show upstream | grep "HEAD branch" | sed 's/.*: //' | tr -d '[:space:]')
+          
+          # 如果检测失败，尝试常见分支名
+          if [[ -z "$UPSTREAM_BRANCH" ]]; then
+            echo "⚠️ 无法自动检测上游默认分支，尝试常见分支名..."
+            for branch in main master; do
+              if git show-ref --verify --quiet "refs/remotes/upstream/$branch"; then
+                UPSTREAM_BRANCH=$branch
+                echo "找到上游分支: $branch"
+                break
+              fi
+            done
+          fi
+          
+          # 获取本地当前分支
+          LOCAL_BRANCH=$(git branch --show-current | tr -d '[:space:]')
+          
+          if [[ -z "$UPSTREAM_BRANCH" || -z "$LOCAL_BRANCH" ]]; then
+            echo "❌ 无法检测分支"
+            echo "  上游默认分支: ${UPSTREAM_BRANCH:-未检测到}"
+            echo "  本地当前分支: ${LOCAL_BRANCH:-未检测到}"
+            exit 1
+          fi
+          
+          echo "📌 检测到的分支："
+          echo "  上游默认分支: $UPSTREAM_BRANCH"
+          echo "  本地当前分支: $LOCAL_BRANCH"
+          
+          echo "upstream_branch=$UPSTREAM_BRANCH" >> $GITHUB_OUTPUT
+          echo "local_branch=$LOCAL_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: 检查是否需要同步
+        id: check_sync_needed
+        if: steps.detect_branches.outputs.upstream_branch != ''
+        run: |
+          UPSTREAM_BRANCH="${{ steps.detect_branches.outputs.upstream_branch }}"
+          LOCAL_BRANCH="${{ steps.detect_branches.outputs.local_branch }}"
+          
+          # 比较本地和上游是否有差异
+          if git diff --quiet "origin/$LOCAL_BRANCH" "upstream/$UPSTREAM_BRANCH"; then
+            echo "✅ Fork 已是最新，无需同步"
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "🔄 检测到上游有更新，需要同步"
+            
+            # 显示落后的提交数
+            COMMITS_BEHIND=$(git rev-list --count "origin/$LOCAL_BRANCH..upstream/$UPSTREAM_BRANCH" 2>/dev/null || echo "unknown")
+            echo "  落后上游 $COMMITS_BEHIND 个提交"
+            
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 初始化保护日志
+        id: init_protection_log
+        if: steps.check_sync_needed.outputs.needs_sync == 'true'
+        run: |
+          mkdir -p /tmp/sync_logs
+          LOG_FILE="/tmp/sync_logs/protection.log"
+          
+          echo "===== 🛡️ 同步保护日志 =====" > "$LOG_FILE"
+          echo "时间: $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
+          echo "当前仓库: ${{ github.repository }}" >> "$LOG_FILE"
+          echo "上游仓库: ${{ env.UPSTREAM_REPO }}" >> "$LOG_FILE"
+          echo "================================" >> "$LOG_FILE"
+          echo "" >> "$LOG_FILE"
+          
+          echo "log_file=$LOG_FILE" >> $GITHUB_OUTPUT
+
+      - name: 备份用户自定义工作流
+        id: backup_workflows
+        if: steps.check_sync_needed.outputs.needs_sync == 'true'
+        run: |
+          BACKUP_DIR="/tmp/my_workflows_backup"
+          mkdir -p "$BACKUP_DIR"
+          LOG_FILE="${{ steps.init_protection_log.outputs.log_file }}"
+          
+          echo "📦 开始备份用户自定义工作流..." | tee -a "$LOG_FILE"
+          BACKUP_COUNT=0
+          
+          # 只备份 my-*.yml 文件
+          if [[ -d ".github/workflows" ]]; then
+            for FILE in .github/workflows/my-*.yml .github/workflows/my-*.yaml; do
+              if [[ -f "$FILE" ]]; then
+                FILENAME=$(basename "$FILE")
+                cp -p "$FILE" "$BACKUP_DIR/$FILENAME"
+                BACKUP_COUNT=$((BACKUP_COUNT + 1))
+                echo "  备份: $FILENAME" | tee -a "$LOG_FILE"
+              fi
+            done
+          fi
+          
+          if [[ $BACKUP_COUNT -gt 0 ]]; then
+            echo "📦 已备份 $BACKUP_COUNT 个用户自定义工作流" | tee -a "$LOG_FILE"
+          else
+            echo "ℹ️ 没有发现用户自定义工作流 (my-*.yml)" | tee -a "$LOG_FILE"
+          fi
+          
+          echo "backup_count=$BACKUP_COUNT" >> $GITHUB_OUTPUT
+          echo "backup_dir=$BACKUP_DIR" >> $GITHUB_OUTPUT
+
+      - name: 智能分析上游变更
+        id: analyze_changes
+        if: steps.check_sync_needed.outputs.needs_sync == 'true'
+        run: |
+          UPSTREAM_BRANCH="${{ steps.detect_branches.outputs.upstream_branch }}"
+          LOCAL_BRANCH="${{ steps.detect_branches.outputs.local_branch }}"
+          LOG_FILE="${{ steps.init_protection_log.outputs.log_file }}"
+          
+          # 关键构建文件的正则表达式
+          CRITICAL_PATTERNS_REGEX="(Dockerfile|docker-compose.*\.(yml|yaml)|Makefile|CMakeLists\.txt|.*\.gradle(\.kts)?|pom\.xml|package(-lock)?\.json|yarn\.lock|go\.(mod|sum)|requirements\.txt|Pipfile(\.lock)?|pyproject\.toml|setup\.(py|cfg)|\.github/workflows/.*\.(yml|yaml))"
+          
+          echo "===== 📊 开始分析变更 =====" | tee -a "$LOG_FILE"
+          
+          # 获取文件列表（使用临时文件避免重复计算）
+          LOCAL_FILES_TMP=$(mktemp)
+          UPSTREAM_FILES_TMP=$(mktemp)
+          git ls-tree -r --name-only "origin/$LOCAL_BRANCH" | sort > "$LOCAL_FILES_TMP"
+          git ls-tree -r --name-only "upstream/$UPSTREAM_BRANCH" | sort > "$UPSTREAM_FILES_TMP"
+          
+          # 计算文件总数
+          TOTAL_LOCAL_FILES=$(wc -l < "$LOCAL_FILES_TMP")
+          TOTAL_UPSTREAM_FILES=$(wc -l < "$UPSTREAM_FILES_TMP")
+          
+          # 计算文件变化
+          DELETED_COUNT=$(comm -23 "$LOCAL_FILES_TMP" "$UPSTREAM_FILES_TMP" | wc -l)
+          ADDED_COUNT=$(comm -13 "$LOCAL_FILES_TMP" "$UPSTREAM_FILES_TMP" | wc -l)
+          MODIFIED_COUNT=$(git diff --diff-filter=MR --name-only "origin/$LOCAL_BRANCH" "upstream/$UPSTREAM_BRANCH" | wc -l)
+          
+          # 检查关键文件删除
+          CRITICAL_DELETED=$(comm -23 "$LOCAL_FILES_TMP" "$UPSTREAM_FILES_TMP" | grep -cE "$CRITICAL_PATTERNS_REGEX" || echo 0)
+          
+          # 清理临时文件
+          rm -f "$LOCAL_FILES_TMP" "$UPSTREAM_FILES_TMP"
+          
+          # 获取代码行数变化
+          echo "正在计算代码变化行数..." | tee -a "$LOG_FILE"
+          LINES_ADDED=$(git diff --numstat "origin/$LOCAL_BRANCH" "upstream/$UPSTREAM_BRANCH" | \
+            awk '{sum+=$1} END {print sum+0}')
+          LINES_DELETED=$(git diff --numstat "origin/$LOCAL_BRANCH" "upstream/$UPSTREAM_BRANCH" | \
+            awk '{sum+=$2} END {print sum+0}')
+          
+          # ===== 智能代码变化分析 =====
+          TOTAL_LINES_CHANGED=$((LINES_ADDED + LINES_DELETED))
+          NET_LINES_CHANGED=$((LINES_ADDED - LINES_DELETED))
+          ABS_NET_CHANGE=${NET_LINES_CHANGED#-}
+          
+          # 智能判断变量初始化
+          SMART_LINES_CHANGED=$TOTAL_LINES_CHANGED
+          CHANGE_PATTERN="未知模式"
+          RISK_LEVEL="MEDIUM"
+          THRESHOLD_MULTIPLIER="1.0"
+          
+          # 智能模式识别
+          if [[ $LINES_ADDED -gt 0 || $LINES_DELETED -gt 0 ]]; then
+            # 计算重叠率
+            LARGER_VALUE=$((LINES_ADDED > LINES_DELETED ? LINES_ADDED : LINES_DELETED))
+            SMALLER_VALUE=$((LINES_ADDED < LINES_DELETED ? LINES_ADDED : LINES_DELETED))
+            
+            if [[ $LARGER_VALUE -gt 0 ]]; then
+              OVERLAP_RATIO=$((SMALLER_VALUE * 100 / LARGER_VALUE))
+            else
+              OVERLAP_RATIO=0
+            fi
+            
+            echo "" | tee -a "$LOG_FILE"
+            echo "🧠 智能代码变化分析:" | tee -a "$LOG_FILE"
+            echo "  • 新增行数: +$LINES_ADDED" | tee -a "$LOG_FILE"
+            echo "  • 删除行数: -$LINES_DELETED" | tee -a "$LOG_FILE"
+            echo "  • 总变化量: $TOTAL_LINES_CHANGED" | tee -a "$LOG_FILE"
+            echo "  • 净变化量: $NET_LINES_CHANGED" | tee -a "$LOG_FILE"
+            echo "  • 重叠率: ${OVERLAP_RATIO}%" | tee -a "$LOG_FILE"
+            
+            # 模式识别和度量选择
+            if [[ $OVERLAP_RATIO -gt ${{ env.OVERLAP_THRESHOLD_HIGH }} ]]; then
+              CHANGE_PATTERN="代码重构"
+              SMART_LINES_CHANGED=$TOTAL_LINES_CHANGED
+              RISK_LEVEL="HIGH"
+              THRESHOLD_MULTIPLIER="0.8"
+              echo "  🔄 检测模式: $CHANGE_PATTERN (采用总变化量)" | tee -a "$LOG_FILE"
+              
+            elif [[ $LINES_ADDED -gt $((LINES_DELETED * 3)) ]]; then
+              CHANGE_PATTERN="新功能添加"
+              SMART_LINES_CHANGED=$NET_LINES_CHANGED
+              RISK_LEVEL="MEDIUM"
+              THRESHOLD_MULTIPLIER="1.0"
+              echo "  ✨ 检测模式: $CHANGE_PATTERN (采用净变化量)" | tee -a "$LOG_FILE"
+              
+            elif [[ $LINES_DELETED -gt $((LINES_ADDED * 3)) ]]; then
+              CHANGE_PATTERN="代码清理"
+              SMART_LINES_CHANGED=$LINES_DELETED
+              RISK_LEVEL="MEDIUM"
+              THRESHOLD_MULTIPLIER="1.2"
+              echo "  🧹 检测模式: $CHANGE_PATTERN (采用删除量)" | tee -a "$LOG_FILE"
+              
+            elif [[ $TOTAL_LINES_CHANGED -lt 100 ]]; then
+              CHANGE_PATTERN="小幅修改"
+              SMART_LINES_CHANGED=$TOTAL_LINES_CHANGED
+              RISK_LEVEL="LOW"
+              THRESHOLD_MULTIPLIER="2.0"
+              echo "  🔧 检测模式: $CHANGE_PATTERN (采用总变化量)" | tee -a "$LOG_FILE"
+              
+            elif [[ $OVERLAP_RATIO -gt ${{ env.OVERLAP_THRESHOLD_MID }} && $TOTAL_LINES_CHANGED -gt 1000 ]]; then
+              CHANGE_PATTERN="大规模更新"
+              SMART_LINES_CHANGED=$TOTAL_LINES_CHANGED
+              RISK_LEVEL="CRITICAL"
+              THRESHOLD_MULTIPLIER="0.5"
+              echo "  🚨 检测模式: $CHANGE_PATTERN (采用总变化量)" | tee -a "$LOG_FILE"
+              
+            else
+              CHANGE_PATTERN="常规更新"
+              TOTAL_WEIGHT_VAL=${{ env.TOTAL_WEIGHT }}
+              NET_WEIGHT_VAL=${{ env.NET_WEIGHT }}
+              SMART_LINES_CHANGED=$((TOTAL_LINES_CHANGED * TOTAL_WEIGHT_VAL / 100 + ABS_NET_CHANGE * NET_WEIGHT_VAL / 100))
+              RISK_LEVEL="MEDIUM"
+              THRESHOLD_MULTIPLIER="1.0"
+              echo "  📝 检测模式: $CHANGE_PATTERN (采用加权值: ${TOTAL_WEIGHT_VAL}%总+${NET_WEIGHT_VAL}%净)" | tee -a "$LOG_FILE"
+            fi
+            
+            # 特殊情况检测
+            if [[ $LINES_ADDED -gt 5000 && $LINES_DELETED -lt 100 ]]; then
+              echo "  ⚠️ 警告: 检测到大量代码注入，需要人工审核！" | tee -a "$LOG_FILE"
+              RISK_LEVEL="CRITICAL"
+              THRESHOLD_MULTIPLIER="0.3"
+            fi
+            
+            echo "  📊 智能决策:" | tee -a "$LOG_FILE"
+            echo "    • 采用值: $SMART_LINES_CHANGED 行" | tee -a "$LOG_FILE"
+            echo "    • 风险等级: $RISK_LEVEL" | tee -a "$LOG_FILE"
+            echo "    • 阈值系数: $THRESHOLD_MULTIPLIER" | tee -a "$LOG_FILE"
+          fi
+          
+          # 计算各种比率
+          DELETE_RATIO=0
+          CHANGE_RATIO=0
+          if [[ $TOTAL_LOCAL_FILES -gt 0 ]]; then
+            DELETE_RATIO=$((DELETED_COUNT * 100 / TOTAL_LOCAL_FILES))
+            CHANGE_RATIO=$(((DELETED_COUNT + MODIFIED_COUNT) * 100 / TOTAL_LOCAL_FILES))
+          fi
+          
+          # 检查 README 差异
+          README_CHANGE_PERCENT=0
+          if [[ -f "README.md" ]]; then
+            echo "正在检查 README.md 差异..." | tee -a "$LOG_FILE"
+            if git show "upstream/$UPSTREAM_BRANCH:README.md" &>/dev/null; then
+              README_STATS=$(git diff --numstat "origin/$LOCAL_BRANCH" "upstream/$UPSTREAM_BRANCH" -- README.md 2>/dev/null || echo "0 0")
+              README_ADDED=$(echo "$README_STATS" | awk '{print $1}')
+              README_DELETED=$(echo "$README_STATS" | awk '{print $2}')
+              README_TOTAL_CHANGES=$((README_ADDED + README_DELETED))
+              ORIGINAL_LINES=$(wc -l < "README.md")
+              
+              if [[ $ORIGINAL_LINES -gt 0 ]]; then
+                README_CHANGE_PERCENT=$((README_TOTAL_CHANGES * 100 / ORIGINAL_LINES))
+              fi
+              echo "  README.md 变化: ${README_CHANGE_PERCENT}%" | tee -a "$LOG_FILE"
+            fi
+          fi
+          
+          # 输出变更分析报告
+          echo "" | tee -a "$LOG_FILE"
+          echo "===== 📊 变更分析报告 =====" | tee -a "$LOG_FILE"
+          echo "📁 文件统计:" | tee -a "$LOG_FILE"
+          echo "  删除文件数: $DELETED_COUNT (${DELETE_RATIO}%)" | tee -a "$LOG_FILE"
+          echo "  新增文件数: $ADDED_COUNT" | tee -a "$LOG_FILE"
+          echo "  修改文件数: $MODIFIED_COUNT" | tee -a "$LOG_FILE"
+          echo "  关键文件删除: $CRITICAL_DELETED" | tee -a "$LOG_FILE"
+          echo "" | tee -a "$LOG_FILE"
+          echo "📝 代码行数变化:" | tee -a "$LOG_FILE"
+          echo "  智能采用值: $SMART_LINES_CHANGED 行" | tee -a "$LOG_FILE"
+          echo "  变更模式: $CHANGE_PATTERN" | tee -a "$LOG_FILE"
+          echo "  风险等级: $RISK_LEVEL" | tee -a "$LOG_FILE"
+          
+          # 输出到 GitHub Actions
+          echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+          echo "added_count=$ADDED_COUNT" >> $GITHUB_OUTPUT
+          echo "modified_count=$MODIFIED_COUNT" >> $GITHUB_OUTPUT
+          echo "delete_ratio=$DELETE_RATIO" >> $GITHUB_OUTPUT
+          echo "change_ratio=$CHANGE_RATIO" >> $GITHUB_OUTPUT
+          echo "critical_deleted=$CRITICAL_DELETED" >> $GITHUB_OUTPUT
+          echo "lines_changed=$SMART_LINES_CHANGED" >> $GITHUB_OUTPUT
+          echo "lines_added=$LINES_ADDED" >> $GITHUB_OUTPUT
+          echo "lines_deleted=$LINES_DELETED" >> $GITHUB_OUTPUT
+          echo "readme_change_percent=$README_CHANGE_PERCENT" >> $GITHUB_OUTPUT
+          echo "change_pattern=$CHANGE_PATTERN" >> $GITHUB_OUTPUT
+          echo "risk_level=$RISK_LEVEL" >> $GITHUB_OUTPUT
+          
+          # 决策逻辑
+          SAFE_TO_SYNC=true
+          BLOCK_REASONS=""
+          
+          if [[ "${{ github.event.inputs.force_sync }}" != "true" ]]; then
+            # 动态调整阈值
+            ORIGINAL_THRESHOLD=${{ env.CODE_LINES_THRESHOLD }}
+            ADJUSTED_THRESHOLD=$(echo "$ORIGINAL_THRESHOLD * $THRESHOLD_MULTIPLIER" | bc | cut -d. -f1)
+            
+            echo "" | tee -a "$LOG_FILE"
+            echo "🎯 智能阈值调整:" | tee -a "$LOG_FILE"
+            echo "  • 原始阈值: $ORIGINAL_THRESHOLD 行" | tee -a "$LOG_FILE"
+            echo "  • 调整后阈值: $ADJUSTED_THRESHOLD 行" | tee -a "$LOG_FILE"
+            
+            # 5个阈值检查
+            if [[ $CRITICAL_DELETED -gt ${{ env.CRITICAL_FILES_THRESHOLD }} ]]; then
+              SAFE_TO_SYNC=false
+              BLOCK_REASONS="${BLOCK_REASONS}\n  - 删除了 $CRITICAL_DELETED 个关键构建文件（阈值: ${{ env.CRITICAL_FILES_THRESHOLD }}）"
+            fi
+            
+            if [[ $DELETE_RATIO -gt ${{ env.DELETE_FILES_THRESHOLD }} ]]; then
+              SAFE_TO_SYNC=false
+              BLOCK_REASONS="${BLOCK_REASONS}\n  - 删除文件比例过高: ${DELETE_RATIO}%（阈值: ${{ env.DELETE_FILES_THRESHOLD }}%）"
+            fi
+            
+            if [[ $CHANGE_RATIO -gt ${{ env.TOTAL_CHANGE_THRESHOLD }} ]]; then
+              SAFE_TO_SYNC=false
+              BLOCK_REASONS="${BLOCK_REASONS}\n  - 项目变化过大: ${CHANGE_RATIO}%（阈值: ${{ env.TOTAL_CHANGE_THRESHOLD }}%）"
+            fi
+            
+            if [[ $README_CHANGE_PERCENT -gt ${{ env.README_DIFF_THRESHOLD }} ]]; then
+              SAFE_TO_SYNC=false
+              BLOCK_REASONS="${BLOCK_REASONS}\n  - README.md 差异过大: ${README_CHANGE_PERCENT}%（阈值: ${{ env.README_DIFF_THRESHOLD }}%）"
+            fi
+            
+            if [[ $SMART_LINES_CHANGED -gt $ADJUSTED_THRESHOLD ]]; then
+              SAFE_TO_SYNC=false
+              BLOCK_REASONS="${BLOCK_REASONS}\n  - 代码变化过大: $SMART_LINES_CHANGED 行（智能阈值: $ADJUSTED_THRESHOLD 行）"
+              BLOCK_REASONS="${BLOCK_REASONS}\n    • 检测模式: $CHANGE_PATTERN"
+              BLOCK_REASONS="${BLOCK_REASONS}\n    • 风险等级: $RISK_LEVEL"
+            fi
+          else
+            echo "⚠️ 强制同步模式已启用，跳过所有安全检查" | tee -a "$LOG_FILE"
+          fi
+          
+          # 输出决策结果
+          if [[ "$SAFE_TO_SYNC" == "true" ]]; then
+            echo "" | tee -a "$LOG_FILE"
+            echo "✅ 分析结果: 可以安全同步" | tee -a "$LOG_FILE"
+            echo "safe_to_sync=true" >> $GITHUB_OUTPUT
+            echo "::notice::✅ 安全检查通过，将执行同步"
+          else
+            echo "" | tee -a "$LOG_FILE"
+            echo "❌ 分析结果: 不建议自动同步" | tee -a "$LOG_FILE"
+            echo "原因:" | tee -a "$LOG_FILE"
+            echo -e "$BLOCK_REASONS" | tee -a "$LOG_FILE"
+            echo "" | tee -a "$LOG_FILE"
+            echo "💡 建议: 请手动检查上游变更，或使用 force_sync 参数强制同步" | tee -a "$LOG_FILE"
+            echo "safe_to_sync=false" >> $GITHUB_OUTPUT
+            echo "block_reason=$BLOCK_REASONS" >> $GITHUB_OUTPUT
+            echo "::warning::⚠️ 同步被安全保护阻止，请查看详细日志"
+          fi
+
+      - name: 执行同步操作
+        if: steps.analyze_changes.outputs.safe_to_sync == 'true'
+        run: |
+          LOG_FILE="${{ steps.init_protection_log.outputs.log_file }}"
+          
+          echo "🔄 开始执行同步..." | tee -a "$LOG_FILE"
+          git checkout "${{ steps.detect_branches.outputs.local_branch }}"
+          
+          # 尝试合并
+          if ! git merge --no-edit "upstream/${{ steps.detect_branches.outputs.upstream_branch }}"; then
+            echo "❌ 合并冲突，请手动处理以下文件：" | tee -a "$LOG_FILE"
+            git diff --name-only --diff-filter=U | tee -a "$LOG_FILE"
+            echo "" | tee -a "$LOG_FILE"
+            echo "💡 解决方案：" | tee -a "$LOG_FILE"
+            echo "  1. 在 GitHub 网页端点击 'Sync fork' 按钮" | tee -a "$LOG_FILE"
+            echo "  2. 如有冲突，点击 'Resolve conflicts' 在线解决" | tee -a "$LOG_FILE"
+            exit 1
+          fi
+          
+          echo "✅ 合并成功" | tee -a "$LOG_FILE"
+
+      - name: 恢复用户自定义工作流
+        if: steps.analyze_changes.outputs.safe_to_sync == 'true' && steps.backup_workflows.outputs.backup_count != '0'
+        run: |
+          BACKUP_DIR="${{ steps.backup_workflows.outputs.backup_dir }}"
+          LOG_FILE="${{ steps.init_protection_log.outputs.log_file }}"
+          RESTORED_COUNT=0
+          
+          # 恢复 my-*.yml 工作流文件
+          if [[ -d "$BACKUP_DIR" ]]; then
+            for FILE in "$BACKUP_DIR"/*.yml "$BACKUP_DIR"/*.yaml; do
+              if [[ -f "$FILE" ]]; then
+                FILENAME=$(basename "$FILE")
+                # 确保目标目录存在
+                mkdir -p ".github/workflows"
+                cp -p "$FILE" ".github/workflows/$FILENAME"
+                git add ".github/workflows/$FILENAME"
+                RESTORED_COUNT=$((RESTORED_COUNT + 1))
+                echo "  恢复: $FILENAME" | tee -a "$LOG_FILE"
+              fi
+            done
+          fi
+          
+          # 如果有文件被恢复，创建一个提交
+          if [[ $RESTORED_COUNT -gt 0 ]]; then
+            if ! git diff --cached --quiet; then
+              git commit -m "🛡️ 保护用户自定义工作流 (my-*.yml)"
+              echo "📦 已恢复 $RESTORED_COUNT 个用户自定义工作流" | tee -a "$LOG_FILE"
+            fi
+          fi
+
+      - name: 推送更新到Fork仓库
+        if: steps.analyze_changes.outputs.safe_to_sync == 'true'
+        run: |
+          LOG_FILE="${{ steps.init_protection_log.outputs.log_file }}"
+          LOCAL_BRANCH="${{ steps.detect_branches.outputs.local_branch }}"
+          
+          # 检查是否有实际的提交需要推送
+          if git log "origin/$LOCAL_BRANCH..HEAD" --oneline | grep -q .; then
+            echo "📤 准备推送更新..." | tee -a "$LOG_FILE"
+            
+            # 显示即将推送的提交
+            COMMIT_COUNT=$(git log "origin/$LOCAL_BRANCH..HEAD" --oneline | wc -l)
+            echo "即将推送 $COMMIT_COUNT 个提交:" | tee -a "$LOG_FILE"
+            git log "origin/$LOCAL_BRANCH..HEAD" --oneline | tee -a "$LOG_FILE"
+            
+            # 执行推送
+            if git push origin "$LOCAL_BRANCH"; then
+              echo "✅ 同步成功完成！" | tee -a "$LOG_FILE"
+              echo "" | tee -a "$LOG_FILE"
+              echo "📊 同步统计:" | tee -a "$LOG_FILE"
+              echo "  - 删除文件: ${{ steps.analyze_changes.outputs.deleted_count }}" | tee -a "$LOG_FILE"
+              echo "  - 新增文件: ${{ steps.analyze_changes.outputs.added_count }}" | tee -a "$LOG_FILE"
+              echo "  - 修改文件: ${{ steps.analyze_changes.outputs.modified_count }}" | tee -a "$LOG_FILE"
+              echo "  - 代码变化: ${{ steps.analyze_changes.outputs.lines_changed }}行" | tee -a "$LOG_FILE"
+              echo "  - 变更模式: ${{ steps.analyze_changes.outputs.change_pattern }}" | tee -a "$LOG_FILE"
+              echo "  - 风险等级: ${{ steps.analyze_changes.outputs.risk_level }}" | tee -a "$LOG_FILE"
+              echo "  - 推送提交: $COMMIT_COUNT 个" | tee -a "$LOG_FILE"
+            else
+              echo "❌ 推送失败，请检查权限和网络连接" | tee -a "$LOG_FILE"
+              exit 1
+            fi
+          else
+            echo "⚠️ 没有需要推送的新提交" | tee -a "$LOG_FILE"
+          fi
+
+      - name: 同步被阻止（安全保护触发）
+        if: steps.analyze_changes.outputs.safe_to_sync == 'false'
+        run: |
+          echo "::error::🚫 同步被智能保护阻止"
+          echo ""
+          echo "===== 🚫 同步被安全保护阻止 ====="
+          echo ""
+          echo "📊 详细统计:"
+          echo "  文件变化:"
+          echo "    - 删除文件: ${{ steps.analyze_changes.outputs.deleted_count }} (${{ steps.analyze_changes.outputs.delete_ratio }}%)"
+          echo "    - 新增文件: ${{ steps.analyze_changes.outputs.added_count }}"
+          echo "    - 修改文件: ${{ steps.analyze_changes.outputs.modified_count }}"
+          echo "    - 关键文件删除: ${{ steps.analyze_changes.outputs.critical_deleted }}"
+          echo ""
+          echo "  代码变化:"
+          echo "    - 新增行数: +${{ steps.analyze_changes.outputs.lines_added }}"
+          echo "    - 删除行数: -${{ steps.analyze_changes.outputs.lines_deleted }}"
+          echo "    - 智能采用值: ${{ steps.analyze_changes.outputs.lines_changed }} 行"
+          echo "    - 变更模式: ${{ steps.analyze_changes.outputs.change_pattern }}"
+          echo "    - 风险等级: ${{ steps.analyze_changes.outputs.risk_level }}"
+          echo ""
+          echo "🛡️ 触发的保护机制:"
+          echo -e "${{ steps.analyze_changes.outputs.block_reason }}"
+          echo ""
+          echo "💡 解决方案:"
+          echo "  1. 查看上游仓库的变更: https://github.com/${{ env.UPSTREAM_REPO }}/commits"
+          echo "  2. 如确认变更安全，手动运行工作流并勾选 'force_sync' 选项"
+          echo "  3. 或在 GitHub 网页端手动同步"
+          echo ""
+          echo "📖 详细日志已保存，请查看 Artifacts 中的 sync-protection-log"
+          exit 1
+
+      - name: 上传同步日志
+        if: always() && steps.init_protection_log.outputs.log_file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-protection-log-${{ github.run_id }}
+          path: ${{ steps.init_protection_log.outputs.log_file }}
+          retention-days: 30
