@@ -53,7 +53,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "styles/style_dialogs.h"
 
 // AyuGram includes
-#include "ayu/features/messageshot/message_shot.h"
+#include "ayu/ayu_settings.h"
+#include "ayu/features/message_shot/message_shot.h"
 #include "styles/style_ayu_icons.h"
 
 
@@ -4042,6 +4043,11 @@ std::optional<QSize> Message::rightActionSize() const {
 }
 
 bool Message::displayFastShare() const {
+	const auto &settings = AyuSettings::getInstance();
+	if (settings.hideFastShare) {
+		return false;
+	}
+
 	const auto item = data();
 	const auto peer = item->history()->peer;
 	if (!item->allowsForward()) {

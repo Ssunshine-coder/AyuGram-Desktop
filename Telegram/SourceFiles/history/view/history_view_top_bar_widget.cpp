@@ -1270,6 +1270,10 @@ void TopBarWidget::updateControlsVisibility() {
 
 	const auto showRecentActions = [&]
 	{
+		const auto &settings = AyuSettings::getInstance();
+		if (!settings.quickAdminShortcuts) {
+			return false;
+		}
 		if (_activeChat.section == Section::ChatsList) {
 			return false;
 		}
@@ -1284,6 +1288,10 @@ void TopBarWidget::updateControlsVisibility() {
 	_recentActions->setVisible(showRecentActions);
 	const auto showAdmins = [&]
 	{
+		const auto &settings = AyuSettings::getInstance();
+		if (!settings.quickAdminShortcuts) {
+			return false;
+		}
 		if (_activeChat.section == Section::ChatsList) {
 			return false;
 		}
